@@ -24,49 +24,60 @@ def ingest_data(
     data_batches: List[pd.DataFrame],
     validate: bool = True,
 ) -> pd.DataFrame:
-    """
-    Ingest and consolidate multiple batches of industrial sensor data.
     
-    This function must handle real-world data quality issues:
-    - Missing or null values
-    - Duplicate readings
-    - Out-of-order timestamps
-    - Data from different sensors with different units
-    - Potentially empty batches
+
+    # make sure data is valid and not empty
+    if not data_batches or not isinstance( data_batches, list ):
+     raise ValueError( "Data must be a non-empty list of DataFrames" )
     
-    Args:
-        data_batches: List of DataFrames, each with columns:
-            - timestamp (datetime): When the reading was taken
-            - sensor (str): Sensor identifier (e.g., "temperature", "pressure")
-            - value (float): Sensor reading (may be NaN)
-            - unit (str): Unit of measurement
-            - quality (str): Data quality flag ("GOOD", "BAD", "UNCERTAIN")
-        validate: If True, perform data validation and cleanup
+    # remove empty or non valid batches
+    valid_data_batches = [ df for df in data_batches if isinstance( df, pd.DataFrame ) and not df.empty ]
+    if not valid_data_batches:
+        raise ValueError( "All batches are empty or invalid" )
     
-    Returns:
-        Consolidated DataFrame with cleaned, deduplicated, and sorted data.
-        Should maintain all original columns plus any derived quality metrics.
-    
-    Raises:
-        ValueError: If data_batches is empty or contains invalid data structures
-    
-    Example:
-        >>> batches = simulator.get_batch_readings(num_batches=5)
-        >>> clean_data = ingest_data(batches, validate=True)
-        >>> print(f"Ingested {len(clean_data)} readings from {len(batches)} batches")
-    
-    CANDIDATE TODO:
-    - Implement robust data ingestion
-    - Handle edge cases (empty batches, all bad quality, etc.)
-    - Remove duplicates intelligently
-    - Sort by timestamp
-    - Consider filtering by quality flags
-    - Document your data cleaning strategy in NOTES.md
-    """
+    df = pd.concat( valid_data_batches, ignore_index=True )
+    # make sure timestamp is of type datetime, put it to NaT otherwise
+    df[ "timestamp" ] = pd.to_datetime( df[ "timestamp" ], errors="coerce" )
+
+
+    if validate:
+        # remove rows with NaT time stamps
+        df = df.dropna( subset=[ "timestamp" ] )
+
+        # remove duplicates
+        df = df.drop_duplicates()
+
+        # one could say you can use them for statistical reasons .. in our case ( next func ) we wont need them 
+        df = df.dropna(subset=["value"])
+
+        # as we dont know the quality if it is missing, UNCERTAIN is literaally the best replacement 
+        df["quality"] = df["quality"].str.upper().fillna("UNCERTAIN")
+
+        # informing the user of the percentqge of bqd quality data gives an insight on how reliable is the data.
+        total_readings = len( df )
+        bad_readings = ( df[ "quality" ] == "BAD" ).sum()
+        bad_percentage = ( bad_readings / total_readings ) * 100
+        print( f"Batch evaluation: { bad_percentage:.2f }% of readings are BAD" )
+
+        # remove bad quality data
+        df = df[ df[ "quality" ] != "BAD" ]
+
+        #using clean data, sort it according the timestamp
+        df = df.sort_values(by="timestamp").reset_index(drop=True)
+
+        # for unknown data, I would try convert the units and standarize it, but considering the simulation,
+        # nothing to be done!
+
+        # add an outlier column, might be usefull 
+        df[ "is_outlier" ] = ( df[ "value" ] < df[ "value" ].quantile( 0.01 ) ) | \
+                           ( df[ "value" ] > df[ "value" ].quantile( 0.99 ) )
+
+    return df
     # TODO: Implement this function
     raise NotImplementedError(
         "ingest_data() must be implemented by the candidate"
     )
+
 
 
 def detect_anomalies(
@@ -75,6 +86,69 @@ def detect_anomalies(
     method: str = "zscore",
     threshold: float = 3.0,
 ) -> pd.DataFrame:
+    
+    # make sure the sensor exists and the method is one of the supported ones
+    if sensor_name not in data[ "sensor" ].unique():
+        raise ValueError( f"Sensor '{ sensor_name }' not found in the data" )
+
+    supported_methods = [ "zscore", "iqr", "rolling" ]
+    if method not in supported_methods:
+        raise ValueError( f"Method '{ method }' not supported. Choose from { supported_methods }" )
+    
+    # get sensor data
+    sensor_df = data[ data[ "sensor" ] == sensor_name ].copy()
+
+    # even though we got rid of them in the previous func, but maybe we use this function on another data for another usecase..
+    valid_values = sensor_df[ "value" ].dropna()
+    if len( valid_values ) < 2:
+        raise ValueError( f"Insufficient data for anomaly detection for sensor '{ sensor_name }'" )
+
+    if sensor_df.empty:
+        raise ValueError( f"No data available for sensor '{ sensor_name }'" )
+    
+    if method == "zscore":
+        mean = valid_values.mean()
+        std = valid_values.std()
+        # division by zero
+        if std == 0:
+            sensor_df[ "anomaly_score" ] = 0.0
+            sensor_df[ "is_anomaly" ] = False
+        else:
+            sensor_df["anomaly_score" ] = (sensor_df["value" ] - mean) / std
+            sensor_df["is_anomaly" ] = sensor_df["anomaly_score" ].abs() > threshold
+
+    elif method == "iqr":
+        Q1 = valid_values.quantile(0.25)
+        Q3 = valid_values.quantile(0.75)
+        IQR = Q3 - Q1
+        if IQR == 0:
+            sensor_df[ "anomaly_score" ] = 0.0
+            sensor_df[ "is_anomaly" ] = False
+        else:
+            sensor_df[ "anomaly_score" ] = ((sensor_df[ "value" ] - Q3) / IQR).abs()
+            sensor_df[ "is_anomaly" ] = (sensor_df[ "value" ] < Q1 - threshold*IQR) | (sensor_df[ "value" ] > Q3 + threshold*IQR)
+
+    elif method == "rolling":
+        # I would put window as a parameter here, trends depend on the sensor and knowldge about the field of application
+        window = 10
+        sensor_df[ "rolling_mean" ] = sensor_df[ "value" ].rolling( window, min_periods=2 ).mean()
+        sensor_df[ "rolling_std" ] = sensor_df[ "value" ].rolling( window, min_periods=2 ).std()
+        sensor_df[ "anomaly_score" ] = (sensor_df[ "value" ] - sensor_df[ "rolling_mean" ]) / sensor_df[ "rolling_std" ]
+        sensor_df[ "is_anomaly" ] = sensor_df[ "anomaly_score" ].abs() > threshold
+        sensor_df.drop(columns=[ "rolling_mean", "rolling_std" ], inplace=True )
+
+    sensor_df["detection_method"] = method
+
+    result = data.merge(
+    sensor_df[[ "timestamp", "sensor", "is_anomaly", "anomaly_score", "detection_method" ]],
+    on=[ "timestamp", "sensor" ],
+    how="left"
+    )
+    result[ "is_anomaly" ] = result[ "is_anomaly" ].fillna(False)
+    result[ "anomaly_score" ] = result[ "anomaly_score" ].fillna(0.0)
+    result[ "detection_method" ] = result[ "detection_method" ].fillna("none")
+
+    return result
     """
     Detect anomalies in sensor data using statistical methods.
     
